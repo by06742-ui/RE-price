@@ -119,15 +119,16 @@ def _idw(kx, kv, xy):
 def estimate_one(pnu, D):
     p = normalize_pnu(pnu)
     if len(p) != 19:
-        return {"PNU": pnu, "지번": "", "토지면적_㎡": None, "평당가_만원": None,
+        return {"PNU": pnu, "지번": "", "토지면적_㎡": None, "토지면적_평": None, "평당가_만원": None,
                 "추정방식": "오류(19자리 아님)", "참고": ""}
     지번 = jibun_from_pnu(p, D["dn"])
     i = np.searchsorted(D["pnu"], p)
     has = i < len(D["pnu"]) and D["pnu"][i] == p
     면적 = round(float(D["area"][i]), 1) if has and not np.isnan(D["area"][i]) else None
+    면적평 = round(면적 / PYEONG, 1) if 면적 is not None else None
 
     def out(v, 방식, 참고):
-        return {"PNU": p, "지번": 지번, "토지면적_㎡": 면적, "평당가_만원": v,
+        return {"PNU": p, "지번": 지번, "토지면적_㎡": 면적, "토지면적_평": 면적평, "평당가_만원": v,
                 "추정방식": 방식, "참고": 참고}
 
     if p in D["prices"]["parcel"]:
@@ -145,7 +146,7 @@ def estimate_one(pnu, D):
 
 
 def rows_to_xlsx(rows):
-    cols = ["PNU", "지번", "토지면적_㎡", "평당가_만원", "추정방식", "참고"]
+    cols = ["PNU", "지번", "토지면적_㎡", "토지면적_평", "평당가_만원", "추정방식", "참고"]
     wb = Workbook(); ws = wb.active; ws.title = "RE_price"
     ws.append(cols)
     for r in rows:
@@ -159,6 +160,7 @@ st.set_page_config(page_title="RE_price 빌라 평당가", page_icon="🏠", lay
 st.title("🏠 서울 빌라(연립다세대) 신축 평당가 산출기")
 st.caption("서울시 실거래가 중 '연립다세대(빌라)'만으로, 특정 지번에 빌라 신축 시 "
            "예상 평당가를 실거래·공간보간(IDW)으로 추정합니다.")
+st.warning("⚠️ **초기 버전**입니다. **2026년 현재의 평단가와 상이할 수 있습니다.** 참고용으로만 활용하세요.")
 
 D = load_data()
 st.success(f"준비 완료 — 실측 {len(D['prices']['parcel']):,}지번 · 좌표 {len(D['pnu']):,}필지")
@@ -172,7 +174,8 @@ with tab1:
         if r["평당가_만원"] is None:
             st.warning(r["추정방식"])
         else:
-            면적 = f"{r['토지면적_㎡']:,.1f}㎡" if r["토지면적_㎡"] is not None else "면적정보없음"
+            면적 = (f"{r['토지면적_㎡']:,.1f}㎡ ({r['토지면적_평']:,.1f}평)"
+                  if r["토지면적_㎡"] is not None else "면적정보없음")
             st.metric(r["지번"] or r["PNU"], f"{r['평당가_만원']:,.0f} 만원/평")
             st.write(f"토지면적 {면적} · 방식 {r['추정방식']} ({r['참고']})")
 
@@ -184,7 +187,8 @@ with tab2:
             st.warning("주소를 PNU로 못 바꿨습니다. '자치구 동 번지' 형식인지 확인하세요.")
         else:
             r = estimate_one(p, D)
-            면적 = f"{r['토지면적_㎡']:,.1f}㎡" if r["토지면적_㎡"] is not None else "면적정보없음"
+            면적 = (f"{r['토지면적_㎡']:,.1f}㎡ ({r['토지면적_평']:,.1f}평)"
+                  if r["토지면적_㎡"] is not None else "면적정보없음")
             st.metric(r["지번"] or r["PNU"], f"{r['평당가_만원']:,.0f} 만원/평")
             st.write(f"토지면적 {면적} · 방식 {r['추정방식']} ({r['참고']})")
 
