@@ -27,8 +27,7 @@ def _load(here):
     area = z["area"].astype(np.float64) if "area" in z.files else np.full(len(pnu), np.nan)
     age = z["age"].astype(np.int16) if "age" in z.files else np.full(len(pnu), -1, np.int16)
     struct = z["struct"].astype(np.uint8) if "struct" in z.files else np.zeros(len(pnu), np.uint8)
-    uq = z["uq"].astype(np.uint8) if "uq" in z.files else np.zeros(len(pnu), np.uint8)
-    o = np.argsort(pnu); pnu, x, y, area, age, struct, uq = pnu[o], x[o], y[o], area[o], age[o], struct[o], uq[o]
+    o = np.argsort(pnu); pnu, x, y, area, age, struct = pnu[o], x[o], y[o], area[o], age[o], struct[o]
     prices = json.load(open(os.path.join(here, "prices.json"), encoding="utf-8"))
     # 호별 — 경량(npz) 우선
     ho = {}
@@ -62,7 +61,7 @@ def _load(here):
     for dgc in dong_idx:
         dong_idx[dgc] = np.asarray(dong_idx[dgc], int)
     return {"pnu": pnu, "x": x, "y": y, "area": area, "age": age, "struct": struct,
-            "prices": prices, "ho": ho, "road": road, "uq": uq,
+            "prices": prices, "ho": ho, "road": road,
             "dn": dn, "rev": {n: c for c, n in dn.items()},
             "kxx": kxx, "kxy": kxy, "kv": kv, "dong_idx": dong_idx,
             "building": prices.get("building", DEF_B)}
@@ -168,12 +167,11 @@ def estimate_one(pnu, D):
     면적평 = round(면적 / PYEONG, 1) if 면적 is not None else None
     det_age = int(D["age"][i]) if has else -1
     det_struct = {1: "rc", 2: "brick"}.get(int(D["struct"][i]) if has else 0)
-    det_uq = bool(D["uq"][i]) if has else False
 
     def out(pair, 방식, 참고):
         return {"PNU": p, "지번": 지번, "토지면적_㎡": 면적, "토지면적_평": 면적평,
                 "신축총_평당_만원": round(float(pair[0]), 1), "토지하한_평당_만원": round(float(pair[1]), 1),
-                "건물_사용연수": det_age, "건물_구조": det_struct, "지구단위": det_uq, "추정방식": 방식, "참고": 참고}
+                "건물_사용연수": det_age, "건물_구조": det_struct, "추정방식": 방식, "참고": 참고}
 
     if p in P["parcel"]:
         return out(P["parcel"][p][:2], "실측", "실거래")
