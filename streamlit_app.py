@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-RE_price (웹앱) — 서울 빌라(연립다세대) 예상 거래가 산출기
-실거래가 = 토지+건물. 대지평당가도 토지+건물 합산으로 산출하며 사용연수에 따라 감가.
-대지평당가(N년) = 토지하한 + (신축총 − 토지하한) × 국세청 공식 잔가율(N년).
-같은 폴더: prices.json, PNU_coords.npz, dongnames.csv / 라이브러리: streamlit, numpy, openpyxl
+RE_price (웹앱) — 서울 빌라(연립다세대) 호별 예상 거래가 산출기
+실거래가 = 토지+건물. 대지평당가(N년) = 토지하한 + (신축총 − 토지하한) × 국세청 공식 잔가율.
+지번 조회 시 그 위 건축물의 호별 대지권비율·평당가·예상가(층별 보정)를 함께 산출.
+같은 폴더: prices.json, PNU_coords.npz, dongnames.csv, ho.json
 """
 import os, csv, glob, json, io
 import numpy as np
@@ -14,6 +14,9 @@ PYEONG = 3.305785
 IDW_K = 8; IDW_P = 2.0; MIN_DONG_PTS = 3
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_B = {"beta": 500.0, "floor": 0.10, "rc": {"rate": 0.018, "life": 50}, "brick": {"rate": 0.0225, "life": 40}}
+# 층별 보정 (동 대비): 반지하 0.625 · 1층 0.854 · 2~3층 1.0(기준) · 4층↑ 1.093
+FLOOR_MULT = {"B": 0.625, "1": 0.854, "2": 1.0, "4": 1.093}
+FLOOR_LABEL = {"B": "반지하", "1": "1층", "2": "2~3층", "4": "4층↑"}
 
 
 def _load(here):
@@ -21,8 +24,14 @@ def _load(here):
     pnu = z["pnu"].astype("U19")
     x = z["x"].astype(np.float64); y = z["y"].astype(np.float64)
     area = z["area"].astype(np.float64) if "area" in z.files else np.full(len(pnu), np.nan)
-    o = np.argsort(pnu); pnu, x, y, area = pnu[o], x[o], y[o], area[o]
+    age = z["age"].astype(np.int16) if "age" in z.files else np.full(len(pnu), -1, np.int16)
+    struct = z["struct"].astype(np.uint8) if "struct" in z.files else np.zeros(len(pnu), np.uint8)
+    o = np.argsort(pnu); pnu, x, y, area, age, struct = pnu[o], x[o], y[o], area[o], age[o], struct[o]
     prices = json.load(open(os.path.join(here, "prices.json"), encoding="utf-8"))
+    try:
+        ho = json.load(open(os.path.join(here, "ho.json"), encoding="utf-8"))
+    except Exception:
+        ho = {}
     dn = {}
     with open(os.path.join(here, "dongnames.csv"), encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
@@ -32,14 +41,15 @@ def _load(here):
     for p, pair in prices["parcel"].items():
         i = np.searchsorted(pnu, p)
         if i < len(pnu) and pnu[i] == p:
-            kxx.append(x[i]); kxy.append(y[i]); kv.append(pair); kdong.append(p[:10])
-    kxx = np.asarray(kxx, float); kxy = np.asarray(kxy, float); kv = np.asarray(kv, float)  # (N,2)
+            kxx.append(x[i]); kxy.append(y[i]); kv.append(pair[:2]); kdong.append(p[:10])
+    kxx = np.asarray(kxx, float); kxy = np.asarray(kxy, float); kv = np.asarray(kv, float)
     dong_idx = {}
     for idx, dgc in enumerate(kdong):
         dong_idx.setdefault(dgc, []).append(idx)
     for dgc in dong_idx:
         dong_idx[dgc] = np.asarray(dong_idx[dgc], int)
-    return {"pnu": pnu, "x": x, "y": y, "area": area, "prices": prices,
+    return {"pnu": pnu, "x": x, "y": y, "area": area, "age": age, "struct": struct,
+            "prices": prices, "ho": ho,
             "dn": dn, "rev": {n: c for c, n in dn.items()},
             "kxx": kxx, "kxy": kxy, "kv": kv, "dong_idx": dong_idx,
             "building": prices.get("building", DEF_B)}
@@ -93,7 +103,7 @@ def _idw_in_dong(D, qx, qy, dong_code):
     k = min(IDW_K, len(d2))
     sel = np.argpartition(d2, k - 1)[:k] if k < len(d2) else np.arange(len(d2))
     d = np.sqrt(d2[sel]); o = np.argsort(d); d = d[o]; sel = sel[o]
-    vals = D["kv"][cand][sel]                       # (k,2)
+    vals = D["kv"][cand][sel]
     if d[0] == 0:
         return vals[0].tolist(), 0.0
     w = 1.0 / (d ** IDW_P)
@@ -112,14 +122,16 @@ def estimate_one(pnu, D):
     has = i < len(D["pnu"]) and D["pnu"][i] == p
     면적 = round(float(D["area"][i]), 1) if has and not np.isnan(D["area"][i]) else None
     면적평 = round(면적 / PYEONG, 1) if 면적 is not None else None
+    det_age = int(D["age"][i]) if has else -1
+    det_struct = {1: "rc", 2: "brick"}.get(int(D["struct"][i]) if has else 0)
 
     def out(pair, 방식, 참고):
         return {"PNU": p, "지번": 지번, "토지면적_㎡": 면적, "토지면적_평": 면적평,
                 "신축총_평당_만원": round(float(pair[0]), 1), "토지하한_평당_만원": round(float(pair[1]), 1),
-                "추정방식": 방식, "참고": 참고}
+                "건물_사용연수": det_age, "건물_구조": det_struct, "추정방식": 방식, "참고": 참고}
 
     if p in P["parcel"]:
-        return out(P["parcel"][p], "실측", "실거래")
+        return out(P["parcel"][p][:2], "실측", "실거래")
     if has:
         r = _idw_in_dong(D, D["x"][i], D["y"][i], p[:10])
         if r is not None:
@@ -127,37 +139,28 @@ def estimate_one(pnu, D):
             return out(pair, "공간보간(동내)", f"최근접 {nd:.0f}m")
     if p[:10] in P["dong"]:
         rec = P["dong"][p[:10]]
-        return out(rec[:2], "동 추정", f"동 {rec[2]}건")
+        return out(rec[:2], "동 추정", f"동 {rec[2] if len(rec) > 2 else 0}건")
     if p[:5] in P["gu"]:
         rec = P["gu"][p[:5]]
-        return out(rec[:2], "구 추정", f"구 {rec[2]}건")
+        return out(rec[:2], "구 추정", f"구 {rec[2] if len(rec) > 2 else 0}건")
     return out(P["total_med"], "전체 추정", "")
 
 
-def enrich(r, age, struct_key, B):
-    if r.get("신축총_평당_만원") is None:
-        return r
-    T0 = r["신축총_평당_만원"]; TL = r["토지하한_평당_만원"]
-    평당 = TL + (T0 - TL) * residual_rate(age, struct_key, B)
-    면적평 = r.get("토지면적_평")
-    r = dict(r)
-    r["사용연수"] = age
-    r["대지평당가_만원"] = round(평당, 1)
-    r["예상거래가_만원"] = round(평당 * 면적평) if 면적평 is not None else None
-    return r
-
-
-COLS = ["PNU", "지번", "토지면적_㎡", "토지면적_평", "사용연수", "대지평당가_만원",
-        "예상거래가_만원", "신축총_평당_만원", "토지하한_평당_만원", "추정방식", "참고"]
-
-
-def rows_to_xlsx(rows):
-    wb = Workbook(); ws = wb.active; ws.title = "RE_price"
-    ws.append(COLS)
-    for r in rows:
-        ws.append([r.get(c) for c in COLS])
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-    return buf.getvalue()
+def units_for(D, pnu, base_pyeong):
+    """호별 [호명, 층, 보정, 대지권㎡, 대지권평, 호평당가, 예상가] — base_pyeong=대지평당가(N년)"""
+    rows = []
+    for 호명, fc, 지분 in D["ho"].get(pnu, []):
+        m = FLOOR_MULT.get(fc, 1.0)
+        호평당 = base_pyeong * m
+        대지평 = 지분 / PYEONG
+        rows.append({"호": 호명, "층": FLOOR_LABEL.get(fc, fc), "층보정": m,
+                     "대지권_㎡": round(지분, 2), "대지권_평": round(대지평, 2),
+                     "호_대지평당가_만원": round(호평당, 1),
+                     "호_예상가_만원": round(호평당 * 대지평)})
+    # 층 → 호명 순 정렬
+    order = {"반지하": 0, "1층": 1, "2~3층": 2, "4층↑": 3}
+    rows.sort(key=lambda r: (order.get(r["층"], 9), r["호"]))
+    return rows
 
 
 def won(manwon):
@@ -166,79 +169,100 @@ def won(manwon):
     return f"{manwon:,.0f}만원 ({eok:,.1f}억)" if eok >= 1 else f"{manwon:,.0f}만원"
 
 
-st.set_page_config(page_title="RE_price 빌라 예상 거래가", page_icon="🏠", layout="centered")
-st.title("🏠 서울 빌라(연립다세대) 예상 거래가 산출기")
-st.caption("실거래가 = 토지+건물. 대지평당가도 토지+건물 합산으로 산출하며 사용연수에 따라 감가됩니다. "
-           "대지평당가(N년) = 토지하한 + (신축총 − 토지하한) × 국세청 공식 잔가율. "
-           "오래될수록 토지하한으로 수렴 → 노후 물건 저가 매입 판단에 활용.")
+def units_xlsx(지번, rows):
+    wb = Workbook(); ws = wb.active; ws.title = "호별"
+    cols = ["호", "층", "층보정", "대지권_㎡", "대지권_평", "호_대지평당가_만원", "호_예상가_만원"]
+    ws.append([지번] + [""] * (len(cols) - 1)); ws.append(cols)
+    for r in rows:
+        ws.append([r.get(c) for c in cols])
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.getvalue()
+
+
+st.set_page_config(page_title="RE_price 호별 예상가", page_icon="🏠", layout="centered")
+st.title("🏠 서울 빌라(연립다세대) 호별 예상 거래가 산출기")
+st.caption("실거래가 = 토지+건물. 대지평당가(N년) = 토지하한 + (신축총 − 토지하한) × 국세청 공식 잔가율. "
+           "지번을 조회하면 그 위 건축물의 호별 대지권비율·평당가·예상가를 층별 보정해 산출합니다.")
 
 D = load_data()
 B = D.get("building", DEF_B)
-st.success(f"준비 완료 — 실측(빌라) {len(D['prices']['parcel']):,}지번 · 좌표 {len(D['pnu']):,}필지")
+_samp = next(iter(D["prices"]["parcel"].values()), [0, 0])
+if not isinstance(_samp, (list, tuple)) or len(_samp) < 2:
+    st.error("⚠️ prices.json이 옛 버전입니다. 새 streamlit_app.py·prices.json·ho.json을 함께 올린 뒤 Reboot 하세요.")
+    st.stop()
+st.success(f"준비 완료 — 실측(빌라) {len(D['prices']['parcel']):,}지번 · 호데이터 {len(D['ho']):,}필지")
 
 st.markdown("**감가 조건**")
-c1, c2 = st.columns(2)
-age = c1.number_input("사용연수(년)", min_value=0, max_value=60, value=20, step=1)
-struct = c2.radio("구조", ["철근콘크리트", "벽돌·연와"], horizontal=True)
-struct_key = "brick" if struct == "벽돌·연와" else "rc"
+auto = st.checkbox("건축물대장에서 사용연수·구조 자동 적용", value=True)
+if auto:
+    man_age, struct_manual = None, None
+    st.caption("조회한 지번에 건축물이 있으면 사용연수·구조를 자동 반영합니다. 정보가 없으면 예상평당가(신축 기준)만 표시됩니다.")
+else:
+    cc1, cc2 = st.columns(2)
+    man_age = cc1.number_input("사용연수(년)", min_value=0, max_value=60, value=20, step=1)
+    struct_manual = "brick" if cc2.radio("구조", ["철근콘크리트", "벽돌·연와"], horizontal=True) == "벽돌·연와" else "rc"
 
-tab1, tab2, tab3 = st.tabs(["① PNU 조회", "② 지번(주소) 조회", "③ 여러 개(엑셀 붙여넣기)"])
+tab1, tab2 = st.tabs(["① 지번(주소) 조회", "② PNU 조회"])
 
 
-def show(r0):
-    if r0.get("신축총_평당_만원") is None:
-        st.warning(r0["추정방식"]); return
-    r = enrich(r0, age, struct_key, B)
+def resolve_age(r):
+    if man_age is not None:
+        return man_age, struct_manual, "수동"
+    if r.get("건물_사용연수", -1) >= 0:
+        return int(r["건물_사용연수"]), (r.get("건물_구조") or "rc"), "자동"
+    return None, None, None
+
+
+def show(r):
+    if r.get("신축총_평당_만원") is None:
+        st.warning(r["추정방식"]); return
+    T0 = r["신축총_평당_만원"]; TL = r["토지하한_평당_만원"]
+    지번 = r["지번"] or r["PNU"]
     면적 = (f"{r['토지면적_㎡']:,.1f}㎡ ({r['토지면적_평']:,.1f}평)"
           if r["토지면적_㎡"] is not None else "면적정보없음")
-    rate = residual_rate(age, struct_key, B)
-    T0 = r["신축총_평당_만원"]; TL = r["토지하한_평당_만원"]
+    age, struct_key, src = resolve_age(r)
+    has_ho = r["PNU"] in D["ho"]
 
-    st.metric((r["지번"] or r["PNU"]) + f" · 대지평당가 (사용 {age}년·잔가율 {rate*100:.0f}%)",
-              f"{r['대지평당가_만원']:,.0f} 만원/평",
-              help="토지+건물 합산. 사용연수가 늘면 건물분이 감가되어 평당가가 내려갑니다.")
-    g1, g2, g3 = st.columns(3)
-    g1.metric("예상 거래가 (평당가×평수)", won(r["예상거래가_만원"]))
-    g2.metric("신축 0년 상한", f"{T0:,.0f} 만원/평")
-    g3.metric("토지하한 (건물 멸실)", f"{TL:,.0f} 만원/평")
+    if age is None and not has_ho:
+        st.metric(f"{지번} · 예상 평당가 (신축 기준)", f"{T0:,.0f} 만원/평", help="건축물 정보 없음")
+        st.write(f"필지 {면적} · [{r['추정방식']} {r['참고']}] · 건축물 정보 없음")
+        return
 
-    curve = " · ".join(f"{a}년 {TL+(T0-TL)*residual_rate(a,struct_key,B):,.0f}" for a in [0,10,20,30,40,50])
-    st.caption(f"사용연수별 대지평당가(만원/평): {curve}")
-    st.write(f"필지면적 {면적} · 방식 {r['추정방식']} ({r['참고']}) · 구조 {struct}")
+    a = age if age is not None else 0
+    sk = struct_key or "rc"
+    평당 = TL + (T0 - TL) * residual_rate(a, sk, B)
+    label = 지번 + " · 대지평당가"
+    if age is not None:
+        구조명 = "벽돌·연와" if sk == "brick" else "철근콘크리트"
+        label += f"  ({구조명}·사용 {a}년·{src})"
+    st.metric(label, f"{평당:,.0f} 만원/평")
+    st.write(f"신축 0년 상한 {T0:,.0f} 만원/평 · 필지 {면적} · [{r['추정방식']} {r['참고']}]")
+
+    rows = units_for(D, r["PNU"], 평당)
+    if rows:
+        st.markdown(f"**호별 예상 ({len(rows)}호)**")
+        view = [{"호": u["호"], "대지권_㎡": u["대지권_㎡"], "대지권_평": u["대지권_평"],
+                 "호_대지평당가_만원": u["호_대지평당가_만원"], "호_예상가_만원": u["호_예상가_만원"]} for u in rows]
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ 호별 엑셀(.xlsx)", data=units_xlsx(지번, rows),
+                           file_name=f"RE_price_호별_{r['PNU']}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 with tab1:
-    pnu = st.text_input("PNU(19자리)", placeholder="예: 1111010200100380007")
-    if st.button("조회", key="b1") and pnu.strip():
-        show(estimate_one(pnu, D))
-
-with tab2:
-    addr = st.text_input("지번 주소", placeholder="예: 강남구 역삼동 601-1")
-    if st.button("조회", key="b2") and addr.strip():
+    addr = st.text_input("지번 주소", placeholder="예: 영등포구 문래동6가 29")
+    if st.button("조회", key="b1") and addr.strip():
         p = address_to_pnu(addr, D["rev"])
         if not p:
             st.warning("주소를 PNU로 못 바꿨습니다. '자치구 동 번지' 형식인지 확인하세요.")
         else:
             show(estimate_one(p, D))
 
-with tab3:
-    st.write(f"엑셀에서 PNU 세로 목록을 복사해 붙여넣으세요. (사용 {age}년·{struct} 기준)")
-    text = st.text_area("PNU 목록", height=150, placeholder="1111010200100380007\n1168010100106010001\n...")
-    if st.button("조회", key="b3"):
-        pnus = []
-        for line in text.splitlines():
-            for tok in line.replace(",", "\t").split("\t"):
-                t = normalize_pnu(tok)
-                if t: pnus.append(t)
-        if not pnus:
-            st.info("PNU를 붙여넣으세요.")
-        else:
-            rows = [enrich(estimate_one(p, D), age, struct_key, B) for p in pnus]
-            st.dataframe(rows, use_container_width=True)
-            st.download_button("⬇️ 엑셀(.xlsx)로 저장", data=rows_to_xlsx(rows),
-                               file_name="RE_price_예상거래가.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with tab2:
+    pnu = st.text_input("PNU(19자리)", placeholder="예: 1115010300100290000")
+    if st.button("조회", key="b2") and pnu.strip():
+        show(estimate_one(pnu, D))
 
 st.divider()
 st.caption("건물원가 500만원/㎡ × 국세청 공식 잔가율(철근콘크리트 50년·1.8%, 벽돌·연와 40년·2.25%, 최종잔존 10%). "
-           "직거래 제외 · 법정동 경계 공간보간. 추정 순서: 실측 → 공간보간 → 동 → 구 → 전체.")
+           "직거래 제외 · 법정동 경계 공간보간 · 호별 대지권 AL_D006(2026.06).")
