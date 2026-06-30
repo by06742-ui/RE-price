@@ -49,21 +49,30 @@ def _load(here):
         for row in csv.DictReader(f):
             c = (row.get("동코드") or "").strip(); n = (row.get("동명") or "").strip()
             if c and n: dn[c] = n
-    kxx, kxy, kv, kdong = [], [], [], []
+    kxx, kxy, kv, kdong, kpnu = [], [], [], [], []
     for p, pair in prices["parcel"].items():
         i = np.searchsorted(pnu, p)
         if i < len(pnu) and pnu[i] == p:
-            kxx.append(x[i]); kxy.append(y[i]); kv.append(pair[:2]); kdong.append(p[:10])
+            kxx.append(x[i]); kxy.append(y[i]); kv.append(pair[:2]); kdong.append(p[:10]); kpnu.append(p)
     kxx = np.asarray(kxx, float); kxy = np.asarray(kxy, float); kv = np.asarray(kv, float)
+    kpnu = np.asarray(kpnu, dtype="U19")
     dong_idx = {}
     for idx, dgc in enumerate(kdong):
         dong_idx.setdefault(dgc, []).append(idx)
     for dgc in dong_idx:
         dong_idx[dgc] = np.asarray(dong_idx[dgc], int)
+    # 필지별 실거래 (근거거래 표시용) — txn_lite.npz 다건
+    tx = {}
+    if os.path.exists(os.path.join(here, "txn_lite.npz")):
+        tz = np.load(os.path.join(here, "txn_lite.npz"), allow_pickle=False)
+        for pp, py_, amt, la, fl, ag, y6 in zip(tz["pnu"].astype("U19"), tz["py"], tz["amt"],
+                                                tz["land"], tz["fl"], tz["age"], tz["ym"]):
+            tx.setdefault(str(pp), []).append({"평당": int(py_), "금액": int(amt), "대지": float(la),
+                                               "층": int(fl), "연식": int(ag), "시점": int(y6)})
     return {"pnu": pnu, "x": x, "y": y, "area": area, "age": age, "struct": struct,
-            "prices": prices, "ho": ho, "road": road,
+            "prices": prices, "ho": ho, "road": road, "tx": tx,
             "dn": dn, "rev": {n: c for c, n in dn.items()},
-            "kxx": kxx, "kxy": kxy, "kv": kv, "dong_idx": dong_idx,
+            "kxx": kxx, "kxy": kxy, "kv": kv, "kpnu": kpnu, "dong_idx": dong_idx,
             "building": prices.get("building", DEF_B)}
 
 
@@ -146,12 +155,16 @@ def _idw_in_dong(D, qx, qy, dong_code):
     k = min(IDW_K, len(d2))
     sel = np.argpartition(d2, k - 1)[:k] if k < len(d2) else np.arange(len(d2))
     d = np.sqrt(d2[sel]); o = np.argsort(d); d = d[o]; sel = sel[o]
-    vals = D["kv"][cand][sel]
+    gsel = cand[sel]                                  # 전역 anchor 인덱스
+    vals = D["kv"][gsel]
     if d[0] == 0:
-        return vals[0].tolist(), 0.0
-    w = 1.0 / (d ** IDW_P)
-    wv = (w[:, None] * vals).sum(0) / w.sum()
-    return wv.tolist(), float(d[0])
+        w = None
+        wv = vals[0]
+    else:
+        w = 1.0 / (d ** IDW_P)
+        wv = (w[:, None] * vals).sum(0) / w.sum()
+    nb = [{"pnu": str(D["kpnu"][gsel[j]]), "dist": float(d[j])} for j in range(len(gsel))]
+    return wv.tolist(), float(d[0]), nb
 
 
 def estimate_one(pnu, D):
@@ -159,7 +172,7 @@ def estimate_one(pnu, D):
     p = normalize_pnu(pnu)
     if len(p) != 19:
         return {"PNU": pnu, "지번": "", "토지면적_㎡": None, "토지면적_평": None,
-                "신축총_평당_만원": None, "토지하한_평당_만원": None, "추정방식": "오류(19자리 아님)", "참고": ""}
+                "신축총_평당_만원": None, "토지하한_평당_만원": None, "추정방식": "오류(19자리 아님)", "참고": "", "근거": None}
     지번 = jibun_from_pnu(p, D["dn"])
     i = np.searchsorted(D["pnu"], p)
     has = i < len(D["pnu"]) and D["pnu"][i] == p
@@ -168,18 +181,18 @@ def estimate_one(pnu, D):
     det_age = int(D["age"][i]) if has else -1
     det_struct = {1: "rc", 2: "brick"}.get(int(D["struct"][i]) if has else 0)
 
-    def out(pair, 방식, 참고):
+    def out(pair, 방식, 참고, 근거=None):
         return {"PNU": p, "지번": 지번, "토지면적_㎡": 면적, "토지면적_평": 면적평,
                 "신축총_평당_만원": round(float(pair[0]), 1), "토지하한_평당_만원": round(float(pair[1]), 1),
-                "건물_사용연수": det_age, "건물_구조": det_struct, "추정방식": 방식, "참고": 참고}
+                "건물_사용연수": det_age, "건물_구조": det_struct, "추정방식": 방식, "참고": 참고, "근거": 근거}
 
     if p in P["parcel"]:
-        return out(P["parcel"][p][:2], "실측", "실거래")
+        return out(P["parcel"][p][:2], "실측", "실거래", [{"pnu": p, "dist": 0.0}])
     if has:
         r = _idw_in_dong(D, D["x"][i], D["y"][i], p[:10])
         if r is not None:
-            pair, nd = r
-            return out(pair, "공간보간(동내)", f"최근접 {nd:.0f}m")
+            pair, nd, nb = r
+            return out(pair, "공간보간(동내)", f"최근접 {nd:.0f}m", nb)
     if p[:10] in P["dong"]:
         rec = P["dong"][p[:10]]
         return out(rec[:2], "동 추정", f"동 {rec[2] if len(rec) > 2 else 0}건")
@@ -234,6 +247,7 @@ if not isinstance(_samp, (list, tuple)) or len(_samp) < 2:
     st.error("⚠️ prices.json이 옛 버전입니다. 새 streamlit_app.py·prices.json·ho.json을 함께 올린 뒤 Reboot 하세요.")
     st.stop()
 st.success(f"준비 완료 — 실측(빌라) {len(D['prices']['parcel']):,}지번 · 호데이터 {len(D['ho']):,}필지")
+st.warning("⚠️ 참고용 추정치이며 평균 ±20% 오차가 있을 수 있습니다. 실제 거래·감정 시 인근 실거래로 반드시 교차 확인하세요.")
 
 st.markdown("**감가 조건**")
 auto = st.checkbox("건축물대장에서 사용연수·구조 자동 적용", value=True)
@@ -245,7 +259,7 @@ else:
     man_age = cc1.number_input("사용연수(년)", min_value=0, max_value=60, value=20, step=1)
     struct_manual = "brick" if cc2.radio("구조", ["철근콘크리트", "벽돌·연와"], horizontal=True) == "벽돌·연와" else "rc"
 
-tab1, tab3 = st.tabs(["① 주소 조회 (지번/도로명)", "② 여러 개(엑셀, 2시트)"])
+tab1, tab2, tab3 = st.tabs(["① 주소 조회 (지번/도로명)", "② PNU 조회", "③ 여러 개(엑셀, 2시트)"])
 
 
 def resolve_age(r):
@@ -302,6 +316,31 @@ def show(r):
                            file_name=f"RE_price_호별_{r['PNU']}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    # ▣ 추정 근거 실거래 — 지번별 추정가와 비교
+    basis = r.get("근거")
+    if basis:
+        rows_b = []
+        for b in basis:
+            for t in D["tx"].get(b["pnu"], []):
+                ym = t.get("시점", 0)
+                rows_b.append({
+                    "지번": jibun_from_pnu(b["pnu"], D["dn"]),
+                    "거리": "실측" if b["dist"] == 0 else f"{round(b['dist']):,}m",
+                    "_d": b["dist"],
+                    "시점": f"{(ym//100)%100:02d}.{ym%100:02d}" if ym else "-",
+                    "_ym": ym,
+                    "실거래_평당_만원": t.get("평당", 0),
+                    "거래가_만원": t.get("금액", 0),
+                    "층": t.get("층", 0), "연식": t.get("연식", 0)})
+        rows_b.sort(key=lambda x: (x["_d"], -x["_ym"]))
+        rows_b = rows_b[:12]
+        if rows_b:
+            st.markdown(f"**추정 근거 실거래 — 추정 대지평당가 `{평당:,.0f}만원/평`과 비교**")
+            view_b = [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows_b]
+            st.dataframe(view_b, use_container_width=True, hide_index=True)
+
+    st.caption("⚠️ 참고용 추정치이며 평균 ±20% 오차가 있을 수 있습니다.")
+
 
 def batch_xlsx(rows):
     """2시트: 평당가 리스트 + 호별 리스트"""
@@ -334,9 +373,14 @@ with tab1:
         else:
             show(estimate_one(p, D))
 
+with tab2:
+    pnu = st.text_input("PNU(19자리)", placeholder="예: 1168010100107810028")
+    if st.button("조회", key="b2") and pnu.strip():
+        show(estimate_one(pnu, D))
+
 with tab3:
-    st.write("주소(지번/도로명)를 줄마다 하나씩 붙여넣으세요. 엑셀은 2시트(평당가·호별)로 저장됩니다.")
-    text = st.text_area("목록", height=160, placeholder="강남구 역삼동 781-28\n영등포구 문래로 191\n강남구 역삼동 601-1")
+    st.write("주소(지번/도로명) 또는 PNU를 줄마다 하나씩 붙여넣으세요. 엑셀은 2시트(평당가·호별)로 저장됩니다.")
+    text = st.text_area("목록", height=160, placeholder="강남구 역삼동 781-28\n영등포구 문래로 191\n1168010100107810028")
     if st.button("조회", key="b3"):
         items = [t.strip() for t in text.splitlines() if t.strip()]
         if not items:
